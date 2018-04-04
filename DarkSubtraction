@@ -1,0 +1,192 @@
+# -*- coding: utf-8 -*-
+"""
+/***************************************************************************
+DarkSubtraction:
+暗像元校正：
+    方法：计算波段中的最小值进行暗像元校正
+过程：1.影像DN值转为辐射能量值（L = DN*gain +bias）
+      2.计算相对反射率（ρ=π×D2×L/（ESUNI×COS(SZ)））
+      3.选择波段最小值进行波段值运算（dataset.data =bands-bandsMin）
+      4.新建栅格数据写入数据（driver = gdal.Create(self, *args, **kwargs)）
+
+ @version <1.1> 2018-04-2 Wujd : Created.
+***************************************************************************/
+"""
+
+from osgeo import  gdal
+from datetime import  datetime
+import  numpy as np
+import numpy.ma as ma
+import xml.dom.minidom
+import  os
+import os.path
+
+
+class DarkSubtraction:
+    def __init__(self, infilename):
+        """
+        初始化变量，文件名，数据集，波段最小值，减去最小值的数据
+        :param infilename:
+         @version <1.1> 2018-04-3 Wujd : Created.
+        """
+        self.fileName = infilename
+        self.dataset = gdal.Open(self.fileName)
+        self._get_rasterinfo()
+        self.mask = ma.masked_values(self.im_data, 0)   #掩模0值
+        self.minValue = self.mask.min()                 #获取波段最小值
+        self.pre_data = self.mask-self.minValue
+
+    def _get_rasterinfo(self):
+        """
+          获取栅格数据的行列数，波段数，放射矩阵，投影信息
+          :param infilename:
+          :return:
+           @version <1.1> 2018-04-2 Wujd : Created.
+        """
+        self.im_width = self.dataset.RasterXSize
+        self.im_height = self.dataset.RasterYSize
+        self.im_bands = self.dataset.RasterCount
+        self.im_geotrans = self.dataset.GetGeoTransform()
+        self.im_proj = self.dataset.GetProjection()
+        self.im_data = self.dataset.ReadAsArray()
+
+    def  calDays(self,productDate):
+        """
+        计算改天所在的年的天数
+        :param productDate:
+        :return:
+        @version <1.1> 2018-04-3 Wujd : Created.
+        """
+        d1= productDate[0].firstChild.data
+        d2 = d1.split("-")
+        d21, d22 = int(d2[0]), int(d2[1])
+        d23 = int(d2[2].split(" ")[0])
+        d3 = datetime(d21, 1, 1)
+        d4 = datetime(d21, d22, d23)
+        days = (d4 - d3).days
+        return  days
+
+    def  readparameter(self,xmlfilename):
+        """
+        从自定义的xml文件中获取参数
+        :param xmlfilename:
+        :return:
+         @version <1.1> 2018-04-3 Wujd : Created.
+        """
+        dom = xml.dom.minidom.parse(xmlfilename)
+        rootdata = dom.documentElement
+        gain_list = rootdata.getElementsByTagName('gain')[0].firstChild.data.split(",")
+        bias_list = rootdata.getElementsByTagName('bias')[0].firstChild.data.split(",")
+        esuni_list= rootdata.getElementsByTagName('esuni')[0].firstChild.data.split(",")
+        sunEle = rootdata.getElementsByTagName("sunElevation")[0].firstChild.data
+        productDate = rootdata.getElementsByTagName('productDate')                      #天数计算
+        days = self.calDays(productDate)
+
+        paradict = {
+            "gain":gain_list,
+            "bias":bias_list,
+            "esuni":esuni_list,
+            "sunEle":sunEle,
+            "days":days
+        }
+
+        return paradict
+
+    def dataDN2ref(self, gain, bias, days, sunEle, esuni):
+        """
+        减去像元波段最小值，计算相对反射率
+        :param minValue:
+        :param gain:
+        :param bias:
+        :param days:
+        :param sunEle:
+        :param esuni:
+        :return:
+         @version <1.1> 2018-04-2 Wujd : Created.
+        """
+        band_L = self.pre_data * gain + bias
+        D = 1-0.01674*np.sin(np.pi/180 * ( 2 * np.pi * (days-93.5)/360))   #日地天文单位距离D
+        sunZen = 90.000 - sunEle                                          # 太阳天顶角
+        band_ref = np.pi * D * band_L / (esuni * np.cos((np.pi / 180) * sunZen))  # 相对反射率
+
+        return band_ref
+
+    def WriteRasterData(self,filename,band_ref):
+        """
+        创建栅格，写入计算后的数据
+        :param driName:
+        :param filename:
+        :param width:
+        :param height:
+        :param bands:
+        :param geotrans:
+        :param proj:
+        :param band_ref:
+        :return:
+          @version <1.1> 2018-04-2 Wujd : Created.
+        """
+        driver = gdal.GetDriverByName("GTiff")
+        dataset = driver.Create(filename,self.im_width,self.im_height,self.im_bands,6,options=["INTERLEAVE=PIXEL"])
+        dataset.SetGeoTransform(self.im_geotrans)
+        dataset.SetProjection(self.im_proj)
+        dataset.GetRasterBand(1).WriteArray(band_ref)
+
+        return "Success"
+
+
+def getTiffilename(path):
+    """
+    遍历路径下的.TIF类型文件
+    :param path:
+    :return:
+     @version <1.1> 2018-04-4Wujd : Created.
+    """
+    tifFilenames=[]
+    for dirpath,dirnames,filenames in os.walk(path):
+        filenames = filter(lambda  filename:filename[-4:]==".TIF",filenames)
+        filenames = map(lambda  filename:os.path.join(dirpath,filename),filenames)
+        tifFilenames.extend(filenames)
+    return  tifFilenames
+
+def darksubtPro(fileName,parafileName):
+    """
+    进行暗像元校正
+    :param fileName:
+    :param parafileName:
+    :return:
+    @version <1.1> 2018-04-4Wujd : Created.
+    """
+    obj = DarkSubtraction(fileName)
+    a = fileName.split("-")
+    i = int(a[len(a) - 1].split(".")[0])
+    #  print(obj.im_data)
+    print("波段最小值",obj.minValue)
+    #print(obj.pre_data)
+    # DN值转表观反射率，读取xml中的参数
+    paralist = obj.readparameter(parafileName)
+    band_ref = obj.dataDN2ref(float(paralist['gain'][i-1]),
+                              float(paralist['bias'][i-1]),
+                              float(paralist['days']),
+                              float(paralist['sunEle']),
+                              float(paralist['esuni'][i-1]))
+    band_ref = band_ref.filled(0)
+    # print(band_ref)
+    # 创建栅格写入数据
+    newfileName = fileName.split(".")[0] + "_darksub" + ".tif"
+    mes = obj.WriteRasterData(newfileName, band_ref)
+    print(i,"\t",mes)
+
+if __name__ == '__main__':
+        parafileName=r"F:\Wujd\0330darkPixel\3285750\testxml.XML"
+        filenames = getTiffilename(r"F:\Wujd\0330darkPixel\3285750")
+        try:
+            for filename in filenames:
+                darksubtPro(filename,parafileName)
+                print(filename,"校正成功")
+        except:
+            print("处理异常")
+
+
+
+
+
